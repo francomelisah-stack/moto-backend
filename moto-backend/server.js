@@ -1,82 +1,164 @@
 const express = require("express");
 const cors = require("cors");
+const mqtt = require("mqtt");
 
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
+// ==================================================
+// MQTT
+// ==================================================
+
+const MQTT_BROKER = "mqtt://broker.hivemq.com:1883";
+
+// Tópico largo para reducir el riesgo de coincidencias
+const MQTT_TOPIC = "francomelisah/moto/001/cmd-7f2a9c";
+
+const mqttClient = mqtt.connect(MQTT_BROKER, {
+  clientId: `render-moto-${Math.random().toString(16).slice(2, 10)}`,
+  reconnectPeriod: 5000,
+  connectTimeout: 30000,
+  clean: true,
+});
+
+mqttClient.on("connect", () => {
+  console.log("MQTT CONECTADO");
+  console.log("Topico:", MQTT_TOPIC);
+});
+
+mqttClient.on("reconnect", () => {
+  console.log("Reconectando MQTT...");
+});
+
+mqttClient.on("error", (error) => {
+  console.error("ERROR MQTT:", error.message);
+});
+
+// ==================================================
+// ESTADO
+// ==================================================
+
 let motoState = {
-  encendida: false,          // Estado solicitado desde la app
-  releEstado: "UNKNOWN",     // Estado real informado por el ESP32
+  encendida: false,
+  releEstado: "UNKNOWN",
+  mqttConectado: false,
   lat: 0,
   lng: 0,
   ultimaActualizacion: new Date(),
-  ultimaConexionESP32: null
+  ultimaConexionESP32: null,
 };
 
-// ─────────────────────────────────────────────
-// Estado general del servidor
-// ─────────────────────────────────────────────
+mqttClient.on("connect", () => {
+  motoState.mqttConectado = true;
+});
+
+mqttClient.on("close", () => {
+  motoState.mqttConectado = false;
+});
+
+// ==================================================
+// PUBLICAR COMANDO MQTT
+// ==================================================
+
+function publicarComando(command, callback) {
+  if (!mqttClient.connected) {
+    return callback(new Error("MQTT no está conectado"));
+  }
+
+  mqttClient.publish(
+    MQTT_TOPIC,
+    command,
+    {
+      qos: 1,
+      retain: true,
+    },
+    callback
+  );
+}
+
+// ==================================================
+// RUTAS
+// ==================================================
 
 app.get("/", (req, res) => {
   res.json({
     status: "OK",
-    sistema: "MotoController Backend"
+    sistema: "MotoController Backend",
+    mqtt: mqttClient.connected,
   });
 });
-
-// ─────────────────────────────────────────────
-// Estado completo de la moto
-// ─────────────────────────────────────────────
 
 app.get("/moto/status", (req, res) => {
   res.json(motoState);
 });
 
-// ─────────────────────────────────────────────
-// Comandos enviados desde la app
-// ─────────────────────────────────────────────
-
-app.post("/moto/start", (req, res) => {
-  motoState.encendida = true;
-  motoState.ultimaActualizacion = new Date();
-
-  res.json({
-    success: true,
-    accion: "START",
-    command: "ON"
-  });
-});
-
-app.post("/moto/stop", (req, res) => {
-  motoState.encendida = false;
-  motoState.ultimaActualizacion = new Date();
-
-  res.json({
-    success: true,
-    accion: "STOP",
-    command: "OFF"
-  });
-});
-
-// ─────────────────────────────────────────────
-// El ESP32 consulta esta ruta
-// ─────────────────────────────────────────────
-
 app.get("/moto/command", (req, res) => {
   res.json({
-    command: motoState.encendida ? "ON" : "OFF"
+    command: motoState.encendida ? "ON" : "OFF",
   });
 });
 
-// ─────────────────────────────────────────────
-// El ESP32 confirma el estado físico del relé
-// Body esperado:
-// {
-//   "relayState": "ON"
-// }
-// ─────────────────────────────────────────────
+// ==================================================
+// ENCENDER
+// ==================================================
+
+app.post("/moto/start", (req, res) => {
+  publicarComando("ON", (error) => {
+    if (error) {
+      console.error("No se pudo publicar ON:", error.message);
+
+      return res.status(503).json({
+        success: false,
+        error: "MQTT no disponible",
+      });
+    }
+
+    motoState.encendida = true;
+    motoState.ultimaActualizacion = new Date();
+
+    console.log("Comando MQTT publicado: ON");
+
+    res.json({
+      success: true,
+      accion: "START",
+      command: "ON",
+    });
+  });
+});
+
+// ==================================================
+// APAGAR
+// ==================================================
+
+app.post("/moto/stop", (req, res) => {
+  publicarComando("OFF", (error) => {
+    if (error) {
+      console.error("No se pudo publicar OFF:", error.message);
+
+      return res.status(503).json({
+        success: false,
+        error: "MQTT no disponible",
+      });
+    }
+
+    motoState.encendida = false;
+    motoState.ultimaActualizacion = new Date();
+
+    console.log("Comando MQTT publicado: OFF");
+
+    res.json({
+      success: true,
+      accion: "STOP",
+      command: "OFF",
+    });
+  });
+});
+
+// ==================================================
+// CONFIRMACIÓN DEL ESP32
+// ==================================================
 
 app.post("/moto/device-status", (req, res) => {
   const { relayState } = req.body;
@@ -84,7 +166,7 @@ app.post("/moto/device-status", (req, res) => {
   if (relayState !== "ON" && relayState !== "OFF") {
     return res.status(400).json({
       success: false,
-      error: "relayState debe ser ON u OFF"
+      error: "relayState debe ser ON u OFF",
     });
   }
 
@@ -93,13 +175,13 @@ app.post("/moto/device-status", (req, res) => {
 
   res.json({
     success: true,
-    relayState: motoState.releEstado
+    relayState,
   });
 });
 
-// ─────────────────────────────────────────────
-// GPS, para la etapa siguiente
-// ─────────────────────────────────────────────
+// ==================================================
+// GPS — PARA LA SIGUIENTE ETAPA
+// ==================================================
 
 app.post("/moto/gps", (req, res) => {
   const { lat, lng } = req.body;
@@ -107,7 +189,7 @@ app.post("/moto/gps", (req, res) => {
   if (typeof lat !== "number" || typeof lng !== "number") {
     return res.status(400).json({
       success: false,
-      error: "Latitud o longitud inválida"
+      error: "Latitud o longitud inválida",
     });
   }
 
@@ -117,11 +199,14 @@ app.post("/moto/gps", (req, res) => {
   motoState.ultimaConexionESP32 = new Date();
 
   res.json({
-    success: true
+    success: true,
   });
 });
 
-// Render utiliza la variable PORT
+// ==================================================
+// SERVIDOR
+// ==================================================
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
